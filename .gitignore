@@ -1,9 +1,5 @@
 .env
+run.log
+*.bak
 __pycache__/
 *.pyc
-*.pyo
-*.db
-.venv/
-venv/
-.vscode/
-.idea/

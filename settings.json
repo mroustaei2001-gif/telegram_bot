@@ -1,0 +1,16 @@
+{
+  "force_join": true,
+  "promo_channels": [
+    {
+      "name": "تست تبلیغ",
+      "link": "https://t.me/njj_va"
+    }
+  ],
+  "show_promo": true,
+  "channel_id": "-1003711238554",
+  "channel_link": "https://t.me/hhsgahaah",
+  "required_referrals": 2,
+  "required_referrals_config": 4,
+  "referral_base_link": "https://t.me/hhsgahaah",
+  "proxy_enabled": true
+}

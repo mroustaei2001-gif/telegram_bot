@@ -3,11 +3,13 @@ import json
 import logging
 import asyncio
 import random
-import requests
+import uuid
+import importlib.util
+import html
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton, ChatMemberUpdated
 from aiogram.enums import ChatAction
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,10 +17,8 @@ from aiogram.exceptions import TelegramBadRequest
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "8916837966:AAHaYZGz2X8OsI5DuZ9_h9RAj5oVDgrhw2s"
-ADMIN_ID = "6282695098"
-MARZBAN_URL = "https://panel.shahinfree.shop"
-MARZBAN_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzaGFoaW4iLCJhY2Nlc3MiOiJhZG1pbiIsImlhdCI6MTc4NTMzMTU2MSwiZXhwIjoxNzg1NDE3OTYxfQ.RoO5wb6GcELmeltlbLeJvmYbHqjk9AdFa5gb60M7V6o"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = os.getenv("ADMIN_ID", "6282695098")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -34,6 +34,7 @@ USER_PARTICIPATION_FILE = "user_participation.json"
 USER_HISTORY_FILE = "user_history.json"
 CHANNEL_LINKS_FILE = "channel_links.json"
 TOPIC_IDEAS_FILE = "topic_ideas.json"
+REF_LINKS_FILE = "ref_links.json"
 
 def load_user_history():
     try:
@@ -161,7 +162,7 @@ def load_settings():
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {"force_join": True, "promo_channels": [], "show_promo": True, "channel_id": "", "channel_link": "", "required_referrals": 2, "proxy_enabled": True}
+        return {"force_join": True, "promo_channels": [], "show_promo": True, "channel_id": "", "channel_link": "", "required_referrals": 2, "required_referrals_config": 4, "referral_base_link": "", "proxy_enabled": True}
 
 def save_settings(settings):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -243,7 +244,7 @@ def save_proxies(proxies):
     with open(PROXIES_FILE, "w", encoding="utf-8") as f:
         json.dump(proxies, f, ensure_ascii=False, indent=2)
 
-def add_proxy(proxy_string):
+def store_proxy(proxy_string):
     proxies = load_proxies()
     proxies.append(proxy_string)
     save_proxies(proxies)
@@ -307,6 +308,147 @@ def add_referral(referrer_id, referred_id):
 def get_referral_count(user_id):
     return len(load_referrals().get(str(user_id), []))
 
+def get_referral_base_link():
+    return load_settings().get("referral_base_link", "")
+
+def set_referral_base_link(link):
+    settings = load_settings()
+    settings["referral_base_link"] = link
+    save_settings(settings)
+
+def get_required_referrals_config():
+    return load_settings().get("required_referrals_config", 4)
+
+def set_required_referrals_config(count):
+    settings = load_settings()
+    settings["required_referrals_config"] = count
+    save_settings(settings)
+
+async def build_referral_link(user_id):
+    base = get_referral_base_link()
+    if not base:
+        bot_username = (await bot.get_me()).username
+        base = f"https://t.me/{bot_username}"
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}start=ref_{user_id}"
+
+PROMO_STATE_FILE = "promo_state.json"
+
+def load_promo_state():
+    try:
+        return json.load(open(PROMO_STATE_FILE, encoding="utf-8"))
+    except Exception:
+        return {"topic_seq": 0, "promo_interval": 2, "users": {}}
+
+def save_promo_state(d):
+    json.dump(d, open(PROMO_STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+
+def get_topic_seq():
+    return load_promo_state().get("topic_seq", 0)
+
+def bump_topic_seq():
+    d = load_promo_state()
+    d["topic_seq"] = d.get("topic_seq", 0) + 1
+    save_promo_state(d)
+    return d["topic_seq"]
+
+def get_promo_interval():
+    return load_promo_state().get("promo_interval", 2)
+
+def get_promo_bonus(uid):
+    return load_promo_state().get("users", {}).get(str(uid), {}).get("bonus", 0)
+
+def should_show_promo(uid):
+    d = load_promo_state()
+    u = d.get("users", {}).get(str(uid), {})
+    last = u.get("last_seq", -999999)
+    seq = d.get("topic_seq", 0)
+    interval = d.get("promo_interval", 2)
+    return (seq - last) >= interval
+
+def record_promo_done(uid):
+    d = load_promo_state()
+    uid = str(uid)
+    d.setdefault("users", {})
+    u = d["users"].setdefault(uid, {})
+    u["last_seq"] = d.get("topic_seq", 0)
+    u["bonus"] = u.get("bonus", 0) + 1
+    save_promo_state(d)
+
+async def _promo_gate(callback, cont_data):
+    uid = str(callback.from_user.id)
+    if uid == ADMIN_ID:
+        return False
+    if not is_promo_enabled():
+        return False
+    chans = get_promo_channels()
+    if not chans:
+        return False
+    if not should_show_promo(uid):
+        return False
+    seq = get_topic_seq()
+    ch = chans[seq % len(chans)]
+    name = html.escape(str(ch.get("name", "کانال تبلیغاتی")))
+    link = str(ch.get("link", ""))
+    text = (f"📢 <b>تبلیغ ویژه</b>\n\n"
+            f"قبل از ارسال نظر، لطفاً در کانال زیر عضو شو و بعد «✅ انجام دادم» را بزن.\n\n"
+            f"🎁 با این کار یک امتیاز bonus می‌گیری که کنار دعوت‌ها در نصاب پروکسی/کانفیگ شمرده می‌شود.\n\n"
+            f"🔗 <b>{name}</b>")
+    rows = []
+    if link:
+        rows.append([InlineKeyboardButton(text=f"📣 عضویت در {name}", url=link)])
+    rows.append([InlineKeyboardButton(text="✅ انجام دادم", callback_data=cont_data)])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_menu")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    return True
+
+async def verify_referrals(user_id):
+    return get_referral_count(user_id) + get_promo_bonus(str(user_id))
+
+def load_ref_links():
+    try:
+        return json.load(open(REF_LINKS_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_ref_links(d):
+    json.dump(d, open(REF_LINKS_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+
+def remove_referral(a, b):
+    r = load_referrals(); k = str(a)
+    if k in r and str(b) in r[k]:
+        r[k].remove(str(b)); save_referrals(r); return True
+    return False
+
+def clear_user_referrals(uid):
+    r = load_referrals(); k = str(uid)
+    if k in r:
+        r[k] = []; save_referrals(r); return True
+    return False
+
+def reset_user_progress(uid):
+    clear_user_referrals(uid)
+    d = load_promo_state(); k = str(uid)
+    u = d.get("users", {}).get(k)
+    if u:
+        u["bonus"] = 0
+        save_promo_state(d)
+
+def reset_user_progress(uid):
+    clear_user_referrals(uid)
+    d = load_promo_state(); k = str(uid)
+    u = d.get("users", {}).get(k)
+    if u:
+        u["bonus"] = 0
+        save_promo_state(d)
+
+async def get_or_create_ref_link(uid):
+    L = load_ref_links(); k = str(uid)
+    if L.get(k):
+        return L[k]
+    inv = await bot.create_chat_invite_link(int(get_channel_id()), name=f"ref_{uid}", member_limit=99999)
+    L[k] = inv.invite_link; save_ref_links(L); return inv.invite_link
+
 def format_user_info(user):
     username = user.username
     full_name = user.full_name or "بدون نام"
@@ -320,42 +462,18 @@ def format_user_info(user):
     info += f" آیدی عددی: {user_id}\n━━━━━━━━━━━━━━━━━━"
     return info
 
-def get_marzban_headers():
-    return {"Authorization": f"Bearer {MARZBAN_TOKEN}", "Content-Type": "application/json"}
+def _load_xui():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "majool")
+    spec = importlib.util.spec_from_file_location("xui_db", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.XuiDB()
 
-def create_or_get_config(user_id):
-    username = f"user_{user_id}"
-    headers = get_marzban_headers()
-    
-    # بررسی وجود کاربر
-    res = requests.get(f"{MARZBAN_URL}/api/user/{username}", headers=headers, verify=False)
-    if res.status_code == 200:
-        return res.json().get("subscription_url", "خطا")
-    
-    # ساخت کاربر جدید
-    from datetime import datetime, timedelta
-    expire_timestamp = int((datetime.now() + timedelta(hours=24)).timestamp())
-    
-    payload = {
-        "username": username,
-        "data_limit": 500 * 1024 * 1024,
-        "expire": expire_timestamp,
-        "inbounds": {
-            "vmess": ["VMess"],
-            "vless": ["VLESS"]
-        },
-        "proxies": {
-            "vmess": {},
-            "vless": {}
-        },
-        "status": "active"
-    }
-    
-    # اصلاح: /api/user به جای /api/users
-    res = requests.post(f"{MARZBAN_URL}/api/user", json=payload, headers=headers, verify=False)
-    if res.status_code in [200, 201]:
-        return res.json().get("subscription_url", "خطا")
-    return f"خطا: {res.status_code}"
+def make_vless_config(user_id):
+    xui = _load_xui()
+    email = f"tg{user_id}_{uuid.uuid4().hex[:6]}"
+    link, u, e, info = xui.make_config(total_gb=500, days=1, limit_ip=1, email=email)
+    return link, info
 
 
 def load_config_access():
@@ -369,7 +487,7 @@ def save_config_access(data):
     with open(CONFIG_ACCESS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def can_user_get_config(user_id):
+def can_user_get_config(user_id, referral_count=None):
     data = load_config_access()
     key = str(user_id)
     if key not in data:
@@ -378,8 +496,9 @@ def can_user_get_config(user_id):
     hours = (datetime.now() - last).total_seconds() / 3600
     if hours >= 24:
         return True, 0
-    if get_referral_count(user_id) >= 4 and not data[key].get("bonus_used", False):
-        return True, 4
+    rc = referral_count if referral_count is not None else get_referral_count(user_id)
+    if rc >= get_required_referrals_config() and not data[key].get("bonus_used", False):
+        return True, get_required_referrals_config()
     return False, int(24 - hours)
 
 def record_config_access(user_id, is_bonus=False):
@@ -418,10 +537,14 @@ class UserState(StatesGroup):
     adding_topic_idea = State()
     adding_channel_link_name = State()
     adding_channel_link_url = State()
+    setting_ref_config_count = State()
+    setting_ref_base = State()
 
 def join_channel_keyboard():
     channel_link = get_channel_link()
-    buttons = [[InlineKeyboardButton(text="📢 عضویت در کانال", url=channel_link)]]
+    buttons = []
+    if channel_link:
+        buttons.append([InlineKeyboardButton(text="📢 عضویت در کانال", url=channel_link)])
     if is_promo_enabled():
         for ch in get_promo_channels():
             buttons.append([InlineKeyboardButton(text=f" {ch['name']}", url=ch['link'])])
@@ -436,6 +559,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton(text="👤 پیام با هویت", callback_data="send_id")],
         [InlineKeyboardButton(text="🎁 پروکسی هدیه", callback_data="free_proxy")],
         [InlineKeyboardButton(text="🔑 دریافت کانفیگ 500 مگ", callback_data="get_config")],
+        [InlineKeyboardButton(text="👥 دعوت دوستان", callback_data="referral_menu")],
         [InlineKeyboardButton(text="📜 قوانین و معرفی ما", callback_data="rules_and_about")],
     ])
 
@@ -456,6 +580,8 @@ def admin_panel_keyboard():
         [InlineKeyboardButton(text=f"🎁 پروکسی: {proxy_status}", callback_data="proxy_settings")],
         [InlineKeyboardButton(text="🔗 لینک‌های کانال", callback_data="channel_links_settings")],
         [InlineKeyboardButton(text=f" دعوت: {get_required_referrals()}", callback_data="set_referral_count")],
+        [InlineKeyboardButton(text=f"🔑 دعوت کانفیگ: {get_required_referrals_config()}", callback_data="set_ref_config_count")],
+        [InlineKeyboardButton(text="🔗 لینک پایه دعوت", callback_data="set_ref_base")],
         [InlineKeyboardButton(text=f"📂 کانال: {get_channel_id()[:15]}...", callback_data="change_channel")],
         [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_menu")]
     ])
@@ -527,6 +653,41 @@ async def send_panel(callback_or_message, user_id, edit=False):
     else:
         await callback_or_message.answer(text, reply_markup=kb, parse_mode="HTML")
 
+class ForceJoinMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        if str(user.id) == ADMIN_ID:
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and event.data == "check_join":
+            return await handler(event, data)
+        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
+            return await handler(event, data)
+        if not is_force_join_enabled():
+            return await handler(event, data)
+        channel_id = get_channel_id()
+        if not channel_id:
+            return await handler(event, data)
+        try:
+            member = await bot.get_chat_member(channel_id, user.id)
+            if member.status in ("member", "administrator", "creator"):
+                return await handler(event, data)
+        except Exception:
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.message.edit_text("⚠️ برای استفاده از ربات، ابتدا باید در کانال عضو بشی.", reply_markup=join_channel_keyboard())
+            except Exception:
+                await event.message.answer("⚠️ برای استفاده از ربات، ابتدا باید در کانال عضو بشی.", reply_markup=join_channel_keyboard())
+            await event.answer()
+        else:
+            await event.answer("⚠️ برای استفاده از ربات، ابتدا باید در کانال عضو بشی.", reply_markup=join_channel_keyboard())
+        return
+
+dp.message.middleware(ForceJoinMiddleware())
+dp.callback_query.middleware(ForceJoinMiddleware())
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
@@ -541,7 +702,7 @@ async def cmd_start(message: Message):
                 await bot.send_message(referrer_id, f" یک نفر با لینک دعوت شما عضو شد!\nتعداد دعوت‌های شما: {get_referral_count(referrer_id)}")
         except:
             pass
-    if is_force_join_enabled() and channel_id:
+    if str(user_id) != ADMIN_ID and is_force_join_enabled() and channel_id:
         try:
             member = await bot.get_chat_member(channel_id, user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -581,7 +742,7 @@ async def refresh_panel(callback: CallbackQuery):
 async def topic_idea_intro(callback: CallbackQuery):
     user_id = callback.from_user.id
     channel_id = get_channel_id()
-    if is_force_join_enabled() and channel_id:
+    if str(user_id) != ADMIN_ID and is_force_join_enabled() and channel_id:
         try:
             member = await bot.get_chat_member(channel_id, user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -612,7 +773,7 @@ async def receive_topic_idea(message: Message, state: FSMContext):
 async def get_config_intro(callback: CallbackQuery):
     user_id = callback.from_user.id
     channel_id = get_channel_id()
-    if is_force_join_enabled() and channel_id:
+    if str(user_id) != ADMIN_ID and is_force_join_enabled() and channel_id:
         try:
             member = await bot.get_chat_member(channel_id, user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -635,12 +796,12 @@ async def get_config_intro(callback: CallbackQuery):
 @dp.callback_query(F.data == "confirm_config")
 async def confirm_config_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-    can_access, info = can_user_get_config(user_id)
+    valid = await verify_referrals(user_id)
+    can_access, info = can_user_get_config(user_id, valid)
     if not can_access:
         hours_left = info
-        bot_username = (await bot.get_me()).username
-        referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-        text = f"️ شما امروز قبلاً کانفیگ دریافت کرده‌اید!\n\n⏰ زمان باقی‌مانده تا دریافت مجدد رایگان: <b>{hours_left} ساعت</b>\n\n💡 <b>راه دریافت فوری:</b>\nاگر <b>4 نفر</b> را با لینک زیر به کانال دعوت کنید، بلافاصله یک کانفیگ دیگر دریافت می‌کنید!\n\n🔗 لینک دعوت شما:\n<code>{referral_link}</code>"
+        referral_link = await build_referral_link(user_id)
+        text = f"️ شما امروز قبلاً کانفیگ دریافت کرده‌اید!\n\n⏰ زمان باقی‌مانده تا دریافت مجدد رایگان: <b>{hours_left} ساعت</b>\n\n💡 <b>راه دریافت فوری:</b>\nاگر <b>{get_required_referrals_config()} نفر</b> را با لینک زیر به کانال دعوت کنید، بلافاصله یک کانفیگ دیگر دریافت می‌کنید!\n\n🔗 لینک دعوت شما:\n<code>{referral_link}</code>"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📋 کپی لینک دعوت", copy_text=CopyTextButton(text=referral_link))],
             [InlineKeyboardButton(text="🔄 بررسی مجدد دعوت‌ها", callback_data="confirm_config")],
@@ -649,15 +810,22 @@ async def confirm_config_handler(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
         return
     await callback.message.edit_text("⏳ در حال ساخت کانفیگ اختصاصی برای شما... لطفاً چند لحظه صبر کنید.")
-    config_link = create_or_get_config(user_id)
-    if config_link.startswith("خطا"):
-        await callback.message.edit_text(f"❌ {config_link}\n\nلطفاً بعداً مجدداً تلاش کنید یا به ادمین پیام دهید.", reply_markup=back_menu_keyboard())
+    try:
+        loop = asyncio.get_running_loop()
+        config_link, cfg_info = await loop.run_in_executor(None, make_vless_config, user_id)
+    except Exception as e:
+        await callback.message.edit_text(f"❌ خطا در ساخت کانفیگ: {e}\n\nلطفاً بعداً مجدداً تلاش کنید یا به ادمین پیام دهید.", reply_markup=back_menu_keyboard())
         return
-    referrals = get_referral_count(user_id)
-    is_bonus = referrals >= 4
+    referrals = valid
+    is_bonus = referrals >= get_required_referrals_config()
     record_config_access(user_id, is_bonus=is_bonus)
-    bot_username = (await bot.get_me()).username
-    referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    if is_bonus:
+        reset_user_progress(user_id)
+        await callback.answer("🎉 چرخه دعوت از نو شروع شد!", show_alert=True)
+    if is_bonus:
+        reset_user_progress(user_id)
+        await callback.answer("🎉 چرخه دعوت از نو شروع شد!", show_alert=True)
+    referral_link = await build_referral_link(user_id)
     text = f"✅ <b>کانفیگ شما با موفقیت ساخته شد!</b>\n\n📊 حجم: 500 مگابایت\n⏰ اعتبار: 24 ساعت\n\n🔗 <b>لینک اشتراک شما:</b>\n<code>{config_link}</code>\n\n💡 برای حمایت از ما، لینک دعوت خود را برای دوستانتان بفرستید:\n<code>{referral_link}</code>"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 کپی لینک اشتراک", copy_text=CopyTextButton(text=config_link))],
@@ -673,7 +841,7 @@ async def free_proxy_intro(callback: CallbackQuery):
         return
     user_id = callback.from_user.id
     channel_id = get_channel_id()
-    if is_force_join_enabled() and channel_id:
+    if str(user_id) != ADMIN_ID and is_force_join_enabled() and channel_id:
         try:
             member = await bot.get_chat_member(channel_id, user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -696,13 +864,13 @@ async def free_proxy_intro(callback: CallbackQuery):
 @dp.callback_query(F.data == "confirm_proxy")
 async def confirm_proxy_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
+    valid = await verify_referrals(user_id)
     can_access, last_access = can_user_access_proxy(user_id)
     if not can_access:
         time_left = timedelta(days=1) - (datetime.now() - last_access)
         hours = int(time_left.total_seconds() // 3600)
         minutes = int((time_left.total_seconds() % 3600) // 60)
-        bot_username = (await bot.get_me()).username
-        referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+        referral_link = await build_referral_link(user_id)
         text = f"⚠️ شما امروز قبلاً پروکسی دریافت کرده‌اید!\n\n زمان باقی‌مانده تا دریافت مجدد: <b>{hours} ساعت و {minutes} دقیقه</b>\n\n💡 <b>راه دریافت فوری:</b>\nاگر <b>2 نفر</b> را با لینک زیر به کانال دعوت کنید، بلافاصله پروکسی ویژه دریافت می‌کنید!\n\n🔗 لینک دعوت شما:\n<code>{referral_link}</code>"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📋 کپی لینک دعوت", copy_text=CopyTextButton(text=referral_link))],
@@ -715,13 +883,16 @@ async def confirm_proxy_handler(callback: CallbackQuery):
     if not proxies:
         await callback.message.edit_text("⚠️ در حال حاضر پروکسی موجود نیست! لطفاً بعداً مراجعه کنید.", reply_markup=back_menu_keyboard())
         return
-    referral_count = get_referral_count(user_id)
+    referral_count = valid
     required_referrals = get_required_referrals()
     proxy_text = random.choice(proxies)
-    bot_username = (await bot.get_me()).username
-    referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    referral_link = await build_referral_link(user_id)
     if referral_count >= required_referrals:
         record_proxy_access(user_id, bonus=True)
+        reset_user_progress(user_id)
+        await callback.answer("🎉 چرخه دعوت از نو شروع شد!", show_alert=True)
+        reset_user_progress(user_id)
+        await callback.answer("🎉 چرخه دعوت از نو شروع شد!", show_alert=True)
         text = f"🎁 <b>پروکسی ویژه شما</b> (به خاطر دعوت {referral_count} نفر):\n\n<code>{proxy_text}</code>\n\n━━━━━━━━━━━━━━━━━━\nهر روز از ما پروکسی رایگان هدیه بگیرید 😻\n\n🔗 لینک دعوت شما:\n<code>{referral_link}</code>"
     else:
         record_proxy_access(user_id, bonus=False)
@@ -901,7 +1072,7 @@ async def add_proxy(message: Message, state: FSMContext):
     if not message.text:
         return
     proxy_string = message.text.strip()
-    add_proxy(proxy_string)
+    store_proxy(proxy_string)
     await message.answer(f"✅ پروکسی اضافه شد!", reply_markup=proxy_settings_keyboard())
     await state.clear()
 
@@ -1068,7 +1239,7 @@ async def view_promo_handler(callback: CallbackQuery):
 async def start_anonymous(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     channel_id = get_channel_id()
-    if is_force_join_enabled() and channel_id:
+    if str(user_id) != ADMIN_ID and is_force_join_enabled() and channel_id:
         try:
             member = await bot.get_chat_member(channel_id, user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -1080,6 +1251,8 @@ async def start_anonymous(callback: CallbackQuery, state: FSMContext):
     if has_user_sent(user_id):
         await callback.message.edit_text("️ شما در طول روز یک بار می‌توانید پیام ارسال کنید!", reply_markup=back_menu_keyboard())
         return
+    if await _promo_gate(callback, "promo_cont_anon"):
+        return
     topic = load_topic()
     await state.set_state(UserState.waiting_anonymous)
     await callback.message.edit_text(f" موضوع امروز: {topic}\n\n پیام ناشناس\n\nپیام متنی خودتون رو ارسال کنید\nاین پیام بدون یوزرنیم شما فوروارد می‌شه🙏\n\n🛡️ توجه: پیام خودتون رو به صورت کامل و بدون کات یک جا بفرستید.🫠🙏\n\n⚠️ برای انصراف دکمه پایین رو بزن.", reply_markup=back_menu_keyboard())
@@ -1088,7 +1261,7 @@ async def start_anonymous(callback: CallbackQuery, state: FSMContext):
 async def start_identified(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     channel_id = get_channel_id()
-    if is_force_join_enabled() and channel_id:
+    if str(user_id) != ADMIN_ID and is_force_join_enabled() and channel_id:
         try:
             member = await bot.get_chat_member(channel_id, user_id)
             if member.status not in ["member", "administrator", "creator"]:
@@ -1099,6 +1272,8 @@ async def start_identified(callback: CallbackQuery, state: FSMContext):
             return
     if has_user_sent(user_id):
         await callback.message.edit_text("⚠️ شما در طول روز یک بار می‌توانید پیام ارسال کنید!", reply_markup=back_menu_keyboard())
+        return
+    if await _promo_gate(callback, "promo_cont_id"):
         return
     topic = load_topic()
     await state.set_state(UserState.waiting_identified)
@@ -1140,6 +1315,30 @@ async def receive_identified(message: Message, state: FSMContext):
     await message.answer("✅ پیام شما با موفقیت به دست ادمین رسید مرسی❤️\n\nحالا می‌توانید از منو، کانفیگ یا پروکسی دریافت کنید!", reply_markup=back_menu_keyboard())
     await state.clear()
 
+@dp.callback_query(F.data == "promo_cont_anon")
+async def promo_cont_anon(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    record_promo_done(user_id)
+    await callback.answer("✅ ممنون! امتیاز تبلیغ ثبت شد.")
+    if has_user_sent(user_id):
+        await callback.message.edit_text("⚠️ شما امروز یک بار نظر داده‌اید.", reply_markup=back_menu_keyboard())
+        return
+    topic = load_topic()
+    await state.set_state(UserState.waiting_anonymous)
+    await callback.message.edit_text(f"📰 موضوع امروز: {topic}\n\n✍️ پیام ناشناس خود را یک‌جا بفرست (بدون یوزرنیم فوروارد می‌شود).\n\nبرای انصراف: 🔙", reply_markup=back_menu_keyboard())
+
+@dp.callback_query(F.data == "promo_cont_id")
+async def promo_cont_id(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    record_promo_done(user_id)
+    await callback.answer("✅ ممنون! امتیاز تبلیغ ثبت شد.")
+    if has_user_sent(user_id):
+        await callback.message.edit_text("⚠️ شما امروز یک بار نظر داده‌اید.", reply_markup=back_menu_keyboard())
+        return
+    topic = load_topic()
+    await state.set_state(UserState.waiting_identified)
+    await callback.message.edit_text(f"📰 موضوع امروز: {topic}\n\n✍️ پیام با هویت خود را یک‌جا بفرست (با یوزرنیم فوروارد می‌شود).\n\nبرای انصراف: 🔙", reply_markup=back_menu_keyboard())
+
 @dp.callback_query(F.data == "back_menu")
 async def back_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1157,6 +1356,7 @@ async def channel_post_handler(message: Message):
         topic = text.replace("📌", "").strip()
         if topic:
             save_topic(topic)
+            bump_topic_seq()
             clear_sent_users()
             save_user_participation({})
             admin_id = int(ADMIN_ID)
@@ -1225,9 +1425,114 @@ async def list_all_users(message: Message):
     except Exception as e:
         await message.answer(f"❌ خطا: {str(e)}")
 
+@dp.callback_query(F.data == "referral_menu")
+async def referral_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    count = get_referral_count(user_id)
+    bonus = get_promo_bonus(str(user_id))
+    total = count + bonus
+    req_proxy = get_required_referrals()
+    req_config = get_required_referrals_config()
+    link = await get_or_create_ref_link(user_id)
+    text = (f"👥 <b>دعوت دوستان</b>\n\n"
+            f"با دعوت دوستانت، پروکسی ویژه و کانفیگ فوری بگیر!\n\n"
+            f"✅ دعوت‌های معتبر: <b>{count}</b>\n"
+            f"📢 امتیاز تبلیغ: <b>{bonus}</b>\n"
+            f"🧮 مجموع: <b>{total}</b>\n"
+            f"🎁 پروکسی ویژه: {total}/{req_proxy}\n"
+            f"🔑 کانفیگ فوری: {total}/{req_config}\n\n"
+            f"🔗 <b>لینک دعوت شما (دوستت با آن عضو کانال می‌شود):</b>\n<code>{link}</code>\n\n"
+            f"💡 راه دیگر امتیاز: هنگام ارسال نظر، در کانال تبلیغاتی عضو شو.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 کپی لینک دعوت", copy_text=CopyTextButton(text=link))],
+        [InlineKeyboardButton(text="🔄 به‌روزرسانی تعداد", callback_data="refresh_referral")],
+        [InlineKeyboardButton(text="🔙 بازگشت به منو", callback_data="back_menu")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+@dp.callback_query(F.data == "refresh_referral")
+async def refresh_referral(callback: CallbackQuery):
+    try:
+        await referral_menu(callback)
+        await callback.answer("🔄 به‌روز شد")
+    except TelegramBadRequest:
+        await callback.answer("🔄 چک شد (تعداد فعلاً تغییر نکرد)")
+
+@dp.callback_query(F.data == "set_ref_config_count")
+async def set_ref_config_count_start(callback: CallbackQuery, state: FSMContext):
+    if str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("❌ دسترسی ندارید!", show_alert=True)
+        return
+    current = get_required_referrals_config()
+    await state.set_state(UserState.setting_ref_config_count)
+    await callback.message.edit_text(f"تعداد فعلی دعوت برای کانفیگ فوری: {current}\n\nعدد جدید را وارد کنید:")
+
+@dp.message(UserState.setting_ref_config_count)
+async def set_ref_config_count(message: Message, state: FSMContext):
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ لطفاً یک عدد معتبر وارد کنید!")
+        return
+    count = int(message.text)
+    if count < 1:
+        await message.answer("❌ عدد باید حداقل 1 باشد!")
+        return
+    set_required_referrals_config(count)
+    await message.answer(f"✅ تعداد دعوت کانفیگ به {count} تغییر کرد!", reply_markup=admin_panel_keyboard())
+    await state.clear()
+
+@dp.callback_query(F.data == "set_ref_base")
+async def set_ref_base_start(callback: CallbackQuery, state: FSMContext):
+    if str(callback.from_user.id) != ADMIN_ID:
+        await callback.answer("❌ دسترسی ندارید!", show_alert=True)
+        return
+    current = get_referral_base_link() or "پیش‌فرض (لینک خود ربات)"
+    await state.set_state(UserState.setting_ref_base)
+    await callback.message.edit_text(f"لینک پایه دعوت فعلی: {current}\n\nلینک جدید را وارد کنید (مثلاً https://t.me/YourBot):\nبرای بازگشت به پیش‌فرض، فقط یک خط‌تیره بفرست: -")
+
+@dp.message(UserState.setting_ref_base)
+async def set_ref_base(message: Message, state: FSMContext):
+    if not message.text:
+        return
+    val = message.text.strip()
+    if val == "-":
+        val = ""
+    set_referral_base_link(val)
+    await message.answer(f"✅ لینک پایه دعوت تنظیم شد: {val or 'پیش‌فرض (لینک ربات)'}", reply_markup=admin_panel_keyboard())
+    await state.clear()
+
+@dp.chat_member()
+async def on_ref_chat_member(update: ChatMemberUpdated):
+    try:
+        logging.info("CM_EVT chat=%s link=%s old=%s new=%s", update.chat.id, (update.invite_link.invite_link if update.invite_link else None), update.old_chat_member.status, update.new_chat_member.status)
+        if str(update.chat.id) != get_channel_id():
+            return
+        inv = update.invite_link
+        if not inv or not getattr(inv, "invite_link", None):
+            return
+        link = inv.invite_link
+        L = load_ref_links(); referrer = None
+        for uid, lk in L.items():
+            if lk == link:
+                referrer = uid; break
+        if not referrer:
+            return
+        nu = update.new_chat_member.user.id
+        os_ = update.old_chat_member.status
+        ns = update.new_chat_member.status
+        if ns in ("member","administrator","creator") and os_ in ("left","kicked"):
+            if str(nu) != referrer and add_referral(referrer, nu):
+                try:
+                    await bot.send_message(int(referrer), f"✅ یک نفر با لینک دعوت شما عضو کانال شد!\nتعداد دعوت‌های معتبر: {get_referral_count(referrer)}")
+                except Exception:
+                    pass
+        elif os_ in ("member","administrator","creator") and ns in ("left","kicked"):
+            remove_referral(referrer, nu)
+    except Exception as e:
+        logging.warning("on_ref_chat_member: %s", e)
+
 async def main():
     logging.info("Bot is starting on Server...")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=["message","callback_query","channel_post","chat_member"])
 
 if __name__ == "__main__":
     asyncio.run(main())
