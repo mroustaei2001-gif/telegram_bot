@@ -464,7 +464,9 @@ def format_user_info(user):
 
 def _load_xui():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "majool")
-    spec = importlib.util.spec_from_file_location("xui_db", path)
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("xui_db", path)
+    spec = importlib.util.spec_from_loader("xui_db", loader)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.XuiDB()

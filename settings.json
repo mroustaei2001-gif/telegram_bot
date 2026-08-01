@@ -1,11 +1,6 @@
 {
   "force_join": true,
-  "promo_channels": [
-    {
-      "name": "تست تبلیغ",
-      "link": "https://t.me/njj_va"
-    }
-  ],
+  "promo_channels": [],
   "show_promo": true,
   "channel_id": "-1003711238554",
   "channel_link": "https://t.me/hhsgahaah",
